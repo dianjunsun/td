@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: td
+Version: 2.0.0
+Summary: 个人交易纪律台：手册 V2.0 的仓位、建仓、回撤与冷静期
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn>=0.32
+Requires-Dist: redis>=5
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"
+Requires-Dist: fakeredis>=2; extra == "dev"
