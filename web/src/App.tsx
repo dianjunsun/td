@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ApiError, api, clearAuth, setAuth, storedAdmin, storedUser } from "./api";
 import { localISO } from "./format";
 import { ActivityPage } from "./pages/Activity";
+import { AccountPage } from "./pages/Account";
 import { CashPage } from "./pages/Cash";
 import { MarketPage } from "./pages/Market";
 import { PositionsPage } from "./pages/Positions";
@@ -38,7 +39,7 @@ export function App() {
   const [admin, setAdmin] = useState(storedAdmin);
   const [tab, setTab] = useState(() => {
     const hash = location.hash.replace("#", "");
-    return TABS.some(([id]) => id === hash) ? hash : "market";
+    return hash === "account" || TABS.some(([id]) => id === hash) ? hash : "market";
   });
   const [draft, setDraft] = useState<{ code: string; name: string } | null>(null);
   const [asOf, setAsOf] = useState(localISO);
@@ -106,7 +107,7 @@ export function App() {
     return <Login onDone={(name) => { setUser(name); setError(""); }} notice={error} />;
   }
 
-  const title = TABS.find(([id]) => id === tab)?.[1] || "行情";
+  const title = tab === "account" ? "账号" : (TABS.find(([id]) => id === tab)?.[1] || "行情");
   const gate: Gate | null = snap
     ? {
         asOf, setAsOf, snap, reload, selected, setSelected, go, draft, setDraft,
@@ -142,6 +143,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <div>{user}</div>
+          <button className="nav-quiet" onClick={() => go("account")}>账号</button>
           <button className="nav-quiet" onClick={logout}>退出</button>
           <div>行情只填价格。记下一笔成交之后，才进入仓位。</div>
         </div>
@@ -150,10 +152,13 @@ export function App() {
         <div className="top">
           <h1>{title}</h1>
           <div className="top-actions">
-            <label className="asof">
-              日期
-              <input type="date" value={asOf} onChange={(event) => setAsOf(event.target.value)} />
-            </label>
+            {tab === "account" ? null : (
+              <label className="asof">
+                日期
+                <input type="date" value={asOf} onChange={(event) => setAsOf(event.target.value)} />
+              </label>
+            )}
+            <button className="btn secondary top-account" type="button" onClick={() => go("account")}>账号</button>
             <button className="btn secondary top-logout" type="button" onClick={logout}>退出</button>
           </div>
         </div>
@@ -164,6 +169,7 @@ export function App() {
         {gate && tab === "cash" ? <CashPage gate={gate} /> : null}
         {gate && tab === "rules" ? <RulesPage gate={gate} /> : null}
         {gate && tab === "activity" ? <ActivityPage gate={gate} /> : null}
+        {gate && tab === "account" ? <AccountPage gate={gate} onUser={setUser} /> : null}
         {snap ? <p className="foot">{snap.disclaimer}</p> : null}
       </main>
       <nav className="tabbar" aria-label="页面">

@@ -132,6 +132,21 @@ class AuthIn(BaseModel):
     password: str
 
 
+class PasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+
+class UsernameIn(BaseModel):
+    username: str
+    password: str
+
+
+class UserPatch(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
 class PositionIn(BaseModel):
     code: str
     name: str = ""
@@ -278,12 +293,47 @@ def create_app() -> FastAPI:
         user = current_user(request)
         return {"id": user.id, "username": user.username, "admin": user.admin}
 
+    @app.post("/api/auth/password")
+    def change_password(request: Request, body: PasswordIn):
+        user = current_user(request)
+        request.app.state.auth.change_password(user.id, body.old_password, body.new_password, request.state.token)
+        return {"ok": True}
+
+    @app.post("/api/auth/username")
+    def change_username(request: Request, body: UsernameIn):
+        user = current_user(request)
+        auth = request.app.state.auth
+        auth.confirm_password(user.id, body.password)
+        updated = auth.rename(user.id, body.username)
+        return {"id": updated.id, "username": updated.username, "admin": updated.admin}
+
     @app.get("/api/users")
     def users(request: Request):
         user = current_user(request)
         if not user.admin:
             raise AuthError("只有管理员可以查看所有人", 403)
         return [{"id": item.id, "username": item.username, "admin": item.admin} for item in request.app.state.auth.list_users()]
+
+    @app.patch("/api/users/{user_id}")
+    def update_user(request: Request, user_id: str, body: UserPatch):
+        actor = current_user(request)
+        if not actor.admin:
+            raise AuthError("只有管理员可以管理用户", 403)
+        username = body.username.strip()
+        password = body.password
+        if not username and not password:
+            raise AuthError("要填写新用户名或新密码", 400)
+        auth = request.app.state.auth
+        if username:
+            auth.rename(user_id, username)
+        if password:
+            if actor.id == user_id:
+                raise AuthError("修改自己的密码要填写当前密码", 400)
+            auth.set_password(user_id, password)
+        updated = next((item for item in auth.list_users() if item.id == user_id), None)
+        if updated is None:
+            raise AuthError("找不到这个用户", 404)
+        return {"id": updated.id, "username": updated.username, "admin": updated.admin}
 
     @app.get("/api/quote-sources")
     def quote_sources(request: Request):

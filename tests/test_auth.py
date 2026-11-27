@@ -34,6 +34,37 @@ def test_two_users_keep_separate_books(client):
     assert client.get("/api/snapshot").status_code == 401
 
 
+def test_user_can_rename_and_change_password(client):
+    other = client.raw.post("/api/auth/register", json={"username": "renamer", "password": "secret2"})
+    assert other.status_code == 200, other.text
+    token = other.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    again = client.raw.post("/api/auth/login", json={"username": "renamer", "password": "secret2"})
+    stale = {"Authorization": f"Bearer {again.json()['token']}"}
+    renamed = client.raw.post("/api/auth/username", headers=headers, json={"username": "renamed", "password": "secret2"})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["username"] == "renamed"
+    assert client.raw.post("/api/auth/login", json={"username": "renamer", "password": "secret2"}).status_code == 401
+    taken = client.raw.post("/api/auth/username", headers=headers, json={"username": "tester", "password": "secret2"})
+    assert taken.status_code == 400
+    changed = client.raw.post("/api/auth/password", headers=headers, json={"old_password": "secret2", "new_password": "secret3"})
+    assert changed.status_code == 200, changed.text
+    assert client.raw.get("/api/auth/me", headers=headers).status_code == 200
+    assert client.raw.get("/api/auth/me", headers=stale).status_code == 401
+    assert client.raw.post("/api/auth/login", json={"username": "renamed", "password": "secret2"}).status_code == 401
+    logged = client.raw.post("/api/auth/login", json={"username": "renamed", "password": "secret3"})
+    assert logged.status_code == 200
+    denied = client.raw.patch("/api/users/1", headers=headers, json={"username": "nope"})
+    assert denied.status_code == 403
+    reset = client.patch("/api/users/" + other.json()["user"]["id"], json={"password": "secret9", "username": "managed"})
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["username"] == "managed"
+    assert client.raw.get("/api/auth/me", headers=headers).status_code == 401
+    assert client.raw.post("/api/auth/login", json={"username": "managed", "password": "secret9"}).status_code == 200
+    own = client.patch("/api/users/1", json={"password": "secret1"})
+    assert own.status_code == 400
+
+
 def test_watchlist_stays_on_the_signed_in_book(client):
     added = client.post("/api/watchlist", json={"code": "600519", "name": "贵州茅台", "market": "SH"})
     assert added.status_code == 200

@@ -88,6 +88,45 @@ class AuthStore:
         if token:
             self.redis.delete(f"td:session:{token}")
 
+    def confirm_password(self, user_id: str, password: str) -> None:
+        stored = self.redis.hget(f"td:user:{user_id}", "password") or ""
+        if not stored or not _verify_password(password, stored):
+            raise AuthError("当前密码不正确", 400)
+
+    def rename(self, user_id: str, username: str) -> User:
+        if not self.redis.exists(f"td:user:{user_id}"):
+            raise AuthError("找不到这个用户", 404)
+        name = _username(username)
+        current = self.redis.hget(f"td:user:{user_id}", "username") or ""
+        if name.casefold() != current.casefold():
+            if not self.redis.set(f"td:user:name:{name.casefold()}", user_id, nx=True):
+                raise AuthError("用户名已存在", 400)
+            if current:
+                self.redis.delete(f"td:user:name:{current.casefold()}")
+        self.redis.hset(f"td:user:{user_id}", "username", name)
+        return self._user(user_id)
+
+    def change_password(self, user_id: str, old_password: str, new_password: str, keep_token: str = "") -> None:
+        self.confirm_password(user_id, old_password)
+        _password(new_password)
+        if old_password == new_password:
+            raise AuthError("新密码要和当前密码不一样", 400)
+        self.redis.hset(f"td:user:{user_id}", "password", _hash_password(new_password))
+        self._drop_sessions(user_id, keep_token)
+
+    def set_password(self, user_id: str, password: str) -> None:
+        if not self.redis.exists(f"td:user:{user_id}"):
+            raise AuthError("找不到这个用户", 404)
+        _password(password)
+        self.redis.hset(f"td:user:{user_id}", "password", _hash_password(password))
+        self._drop_sessions(user_id)
+
+    def _drop_sessions(self, user_id: str, keep_token: str = "") -> None:
+        for key in self.redis.scan_iter("td:session:*"):
+            token = key[len("td:session:"):]
+            if token != keep_token and self.redis.get(key) == user_id:
+                self.redis.delete(key)
+
     def user_for_token(self, token: str) -> User | None:
         if not token:
             return None

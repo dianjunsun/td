@@ -105,13 +105,15 @@ curl -sS http://127.0.0.1:8765/api/health
 
 ## 5. 挂到域名
 
-站点名用 `tdsite.cn`。A 记录要已经指向这台机器。
+站点名用 `tdsite.cn` 和 `www.tdsite.cn`。两条 A 记录都要指向这台机器。平时用域名打开，不要用 `https://公网IP`。
+
+先放业务站点，并去掉系统自带的 default，避免和后面的默认站点抢 80 端口：
 
 ```bash
 sudo tee /etc/nginx/sites-available/td >/dev/null <<'EOF'
 server {
     listen 80;
-    server_name tdsite.cn;
+    server_name tdsite.cn www.tdsite.cn;
 
     client_max_body_size 4m;
 
@@ -129,15 +131,53 @@ sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-签发证书并让 Nginx 跳转到 HTTPS：
+签发证书并让 Nginx 跳转到 HTTPS。两个名字都要写进证书，证书目录一般是第一个名字，这台机器实际在 `/etc/letsencrypt/live/www.tdsite.cn/`：
 
 ```bash
-sudo certbot --nginx -d tdsite.cn
+sudo certbot --nginx -d www.tdsite.cn -d tdsite.cn
 ```
 
-按提示填邮箱。完成后用浏览器打开 `https://tdsite.cn` 。证书到期前 certbot 会自动续期，可以用 `sudo certbot renew --dry-run` 看一眼。
+按提示填邮箱。完成后用浏览器打开 `https://tdsite.cn` 或 `https://www.tdsite.cn` 。证书到期前 certbot 会自动续期，可以用 `sudo certbot renew --dry-run` 看一眼。
 
 页面路由在 `#` 后面，例如 `https://tdsite.cn/#positions`。Nginx 不用另做前端路由。
+
+证书签好之后，再加一个默认站点。业务站点只匹配这两个域名。如果 80/443 没有 `default_server`，用公网 IP 访问、或者 HTTPS 没有带对域名（SNI）时，Nginx 没有可匹配的 server，会在 TLS 握手或读 HTTP 的阶段直接关掉连接。客户端看到的就是 `Remote end closed connection without response`，而不是一张普通的错误页。
+
+默认站点要返回明确的 HTTP 状态。不要写 `return 444`，444 就是不回任何内容、直接断开，会把这个报错再造出来。
+
+```bash
+sudo tee /etc/nginx/sites-available/default-ip >/dev/null <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 403;
+}
+
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_certificate /etc/letsencrypt/live/www.tdsite.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/www.tdsite.cn/privkey.pem;
+    return 403;
+}
+EOF
+sudo ln -sfn /etc/nginx/sites-available/default-ip /etc/nginx/sites-enabled/default-ip
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+如果 `ls /etc/letsencrypt/live/` 里的目录不是 `www.tdsite.cn`，把上面两行证书路径改成实际目录。
+
+检查时，裸 IP 应该是 403，域名仍然是正常页面：
+
+```bash
+curl -sI http://127.0.0.1 --max-time 5 | head -1
+curl -skI https://127.0.0.1 --max-time 5 | head -1
+curl -sI https://tdsite.cn --max-time 5 | head -1
+```
+
+前两行是 `HTTP/1.1 403 Forbidden`。最后一行是 `HTTP/1.1 200 OK`，或先 `301` 再打开 HTTPS。业务只从域名进。
 
 ## 6. 第一个账号
 
@@ -192,4 +232,5 @@ sudo tar -C / -czf "$HOME/td-backup-$(date +%F).tar.gz" opt/td/data/users var/li
 - 打开是「前端还没构建」：在 `/opt/td/web` 执行 `npm run build`，再 `sudo systemctl restart td`
 - 注册或登录失败：`redis-cli ping`，以及 `journalctl -u td -n 50 --no-pager` 里有没有「连不上 Redis」
 - 行情失败、仓位现价不更新：在服务器上 `curl -I http://push2.eastmoney.com` 和 `curl -I https://hq.sinajs.cn`。超时就是这台机器出不去，或行情源暂时不可用。换源不会自动发生，页面上选的源失败就直接报错
+- 出现 `Remote end closed connection without response`：多半是用公网 IP 访问了 HTTPS，而 Nginx 没有 `default_server`。按上面的默认站点配好后，裸 IP 会返回 403，域名访问保持 200。先看 `sudo tail -50 /var/log/nginx/error.log`，再用 `sudo nginx -T` 确认 443 上既有 `tdsite.cn` / `www.tdsite.cn`，也有 `default_server`。不要用 `return 444`
 - 证书失败：先确认 `curl -I http://tdsite.cn` 能到 Nginx，再跑 certbot。域名还没解析到这台机器时，证书签不下来
