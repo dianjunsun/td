@@ -232,9 +232,9 @@ export function MarketPage({ gate }: { gate: Gate }) {
   const tone = changePct == null ? "flat" : changePct > 0 ? "rise" : changePct < 0 ? "fall" : "flat";
 
   return (
-    <div className="split">
-      <section className="card stack">
-        <div className="row">
+    <div className="market">
+      <section className="card stack market-list">
+        <div className="toolbar">
           <label>行情源
             <select value={gate.quoteSource} onChange={(event) => gate.setQuoteSource(event.target.value)}>
               {gate.quoteSources.map((item) => (
@@ -242,10 +242,6 @@ export function MarketPage({ gate }: { gate: Gate }) {
               ))}
             </select>
           </label>
-          <label className="span-2">搜索
-            <input value={query} placeholder="代码或名称，例如 600519、茅台" onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") search(); }} />
-          </label>
-          <button className="btn secondary" type="button" onClick={search}>搜索</button>
           <label>刷新
             <select value={String(refreshMs)} onChange={(event) => {
               const next = Number(event.target.value);
@@ -255,6 +251,12 @@ export function MarketPage({ gate }: { gate: Gate }) {
               {REFRESH.map(([ms, label]) => <option key={ms} value={ms}>{label}</option>)}
             </select>
           </label>
+          <div className="search-line">
+            <label>搜索
+              <input value={query} placeholder="代码或名称，例如 600519、茅台" onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") search(); }} />
+            </label>
+            <button className="btn secondary" type="button" onClick={search}>搜索</button>
+          </div>
         </div>
         <p className="hint">{refreshMs ? `每 ${refreshMs / 1000} 秒向${source?.label || "当前行情源"}拉一次正在看的报价、榜单和当前这张图` : "自动刷新已关闭"}{refreshedAt ? ` · 上次 ${refreshedAt}` : ""}。</p>
         <div className="row">
@@ -262,18 +264,18 @@ export function MarketPage({ gate }: { gate: Gate }) {
             <button key={id} className={`btn ${source?.board && mode === "board" && sort === id ? "" : "secondary"}`} type="button" disabled={!source?.board} onClick={() => setSort(id)}>{label}</button>
           ))}
         </div>
-        <Board rows={rows} picked={picked?.code || ""} onPick={setPicked} empty={listEmpty()} />
+        <div className="table-wrap"><Board rows={rows} picked={picked?.code || ""} onPick={setPicked} empty={listEmpty()} /></div>
         <h2>自选</h2>
         <p className="hint">自选名单存在你的账本里，不跟行情源走。这里的最新价固定用东方财富，每轮刷新只更新数字。</p>
-        <Board rows={watch} picked={picked?.code || ""} onPick={setPicked} empty="还没有自选。从上面点一只，再加入。" />
+        <div className="table-wrap"><Board rows={watch} picked={picked?.code || ""} onPick={setPicked} empty="还没有自选。从上面点一只，再加入。" /></div>
       </section>
-      <section className="card stack">
-        {!picked ? <p className="hint">从左边选一只股票。</p> : (
+      <section className="card stack market-detail">
+        {!picked ? <p className="hint">点一只股票，这里看报价和 K 线。</p> : (
           <>
             <h2>{picked.name} {picked.code}</h2>
             <div className={`quote-hero ${tone}`}>{px(price)}</div>
             <p className={tone}>{pct(changePct)} {change == null ? "" : money(change)}</p>
-            <div className="row">
+            <div className="segments">
               {PERIODS.map(([id, label]) => (
                 <button key={id} className={`btn ${period === id ? "" : "secondary"}`} type="button" onClick={() => { localStorage.setItem("td-chart-period", id); setPeriod(id); }}>{label}</button>
               ))}
@@ -290,10 +292,10 @@ export function MarketPage({ gate }: { gate: Gate }) {
               <div><div className="hint">成交额</div><div>{money(amount)}</div></div>
               <div><div className="hint">VWAP</div><div>{detail?.vwap ? detail.vwap : "—"}</div></div>
             </div>
-            <p className="hint">{detail ? `${detail.source_label} ${detail.as_of}` : source?.label}。看盘不改账本，建计划后仍要自己写失效条件和仓位。</p>
+            <p className="hint">{detail ? `${detail.source_label} ${detail.as_of}` : source?.label}。看盘不改账本，记入仓位之后才入账。</p>
             <div className="row">
               <button className="btn secondary" type="button" onClick={() => toggleWatch(picked)}>{saved.includes(picked.code) ? "移出自选" : "加入自选"}</button>
-              <button className="btn" type="button" onClick={() => { gate.setDraft({ code: picked.code, name: picked.name }); gate.go("plans"); }}>拿去建计划</button>
+              <button className="btn" type="button" onClick={() => { gate.setDraft({ code: picked.code, name: picked.name }); gate.go("positions"); }}>记入仓位</button>
             </div>
           </>
         )}

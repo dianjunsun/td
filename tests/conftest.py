@@ -29,6 +29,10 @@ class Authed:
         kwargs["headers"] = self._headers(kwargs.get("headers"))
         return self.raw.delete(url, **kwargs)
 
+    def patch(self, url, **kwargs):
+        kwargs["headers"] = self._headers(kwargs.get("headers"))
+        return self.raw.patch(url, **kwargs)
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):

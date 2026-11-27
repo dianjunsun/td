@@ -11,6 +11,7 @@ from td_core.actions import build_actions
 from td_core.calendar import add_trading_days, calendar_warning, is_trading_day
 from td_core.handbook import HANDBOOK
 from td_core.num import money, store_decimal
+from td_core.quotes import QuoteError, normalize
 from td_core.params import RuleParams, pct_text, ratio_text
 from td_core.portfolio import Corp, Lot, Mark, PositionView, blocks_new_plan, build_position
 from td_core.rules import (
@@ -96,6 +97,49 @@ def now_iso() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
 
 
+def _public_activity(row) -> dict:
+    item = dict(row)
+    action = item.get("action") or ""
+    subject = item.get("subject") or ""
+    summary = item.get("summary") or ""
+    if not subject:
+        if action in ("买入", "卖出"):
+            subject = f"{action}单只股票"
+            action = "记入"
+        elif action == "记入":
+            subject = "卖出单只股票" if "卖出" in summary else "买入单只股票"
+        elif action == "撤回":
+            subject = "卖出单只股票" if "卖出" in summary else "买入单只股票"
+        elif action == "修改":
+            if "总资产" in summary:
+                subject = "修改总资产"
+            elif "现金" in summary:
+                subject = "修改现金"
+            else:
+                subject = "修改单只股票"
+    item["action"] = action
+    item["subject"] = subject
+    return item
+
+
+CAPITAL_KINDS = {"in": "出资", "out": "撤资"}
+
+
+def parse_moment(value: str | None) -> str:
+    text = (value or "").strip().replace(" ", "T")
+    if len(text) == 10:
+        text += "T00:00"
+    if len(text) == 16:
+        text += ":00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ServiceError("时间格式应为 YYYY-MM-DD HH:MM") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def parse_day(value: str | None, fallback: date | None = None) -> date:
     if not value:
         return fallback or today_sh()
@@ -141,6 +185,25 @@ def require_trading_day(day: date) -> None:
         raise ServiceError("该日不是沪深交易日")
 
 
+def position_code(value: str) -> str:
+    text = (value or "").strip()
+    try:
+        return normalize(text)[0]
+    except QuoteError:
+        compact = text.upper().replace(" ", "")
+        if compact and len(compact) <= 16:
+            return compact
+        raise ServiceError("请使用 6 位股票代码") from None
+
+
+def held_shares(fills: list[dict]) -> Decimal:
+    total = Decimal("0")
+    for row in fills:
+        qty = dec(row["shares"])
+        total += qty if row["side"] == "buy" else -qty
+    return total
+
+
 class Service:
     def __init__(self, db: Database):
         self.db = db
@@ -162,7 +225,7 @@ class Service:
             ]
         return self._public_snapshot(day, bundle, weekly, notes, nav_points)
 
-    def update_account(self, data: dict) -> dict:
+    def update_account(self, data: dict, actor: tuple[str, str] = ("", "")) -> dict:
         day = parse_day(data.get("as_of"))
         nav = money(dec(data.get("nav")))
         cash = money(dec(data.get("cash")))
@@ -221,6 +284,15 @@ class Service:
                     halt,
                 ),
             )
+            old_nav = dec(current["nav"])
+            old_cash = dec(current["cash"])
+            if nav != old_nav or cash != old_cash:
+                subject = "修改总资产" if nav != old_nav else "修改现金"
+                self._log(
+                    conn, actor, "修改", "", "资金盘",
+                    f"总资产 {old_nav} 改为 {nav}，现金 {old_cash} 改为 {cash}",
+                    subject=subject,
+                )
             conn.execute(
                 """
                 INSERT INTO nav_snapshots (as_of, nav, cash, nav_peak, drawdown, created_at)
@@ -424,6 +496,407 @@ class Service:
             )
             conn.execute("UPDATE account SET cash = ? WHERE id = 1", (store_decimal(cash),))
             return {"id": cursor.lastrowid}
+
+    def record_position(self, data: dict, actor: tuple[str, str] = ("", "")) -> dict:
+        """记仓位：股票类型、成交价格和数量，或只更新现价。不走计划、闸门和冷静期。"""
+        code = position_code(data.get("code") or "")
+        name = (data.get("name") or "").strip()
+        asset = data.get("asset_type") or ""
+        action = data.get("action") or "trade"
+        if not code:
+            raise ServiceError("代码不能空")
+        if asset not in ASSET_CAPS:
+            raise ServiceError("未知股票类型")
+        if action not in ("trade", "price", "type"):
+            raise ServiceError("只能记成交、现价或股票类型")
+        day = parse_day(data.get("trade_date")) if action != "type" else None
+        if day is not None:
+            require_trading_day(day)
+        price = dec(data.get("price")) if action != "type" else None
+        shares = dec(data.get("shares")) if action == "trade" else None
+        side = data.get("side") or "buy"
+        if action != "type" and (price is None or price <= 0):
+            raise ServiceError("价格必须大于 0")
+        if action == "trade":
+            if side not in ("buy", "sell"):
+                raise ServiceError("方向只能是买入或卖出")
+            if shares is None or shares <= 0:
+                raise ServiceError("数量必须大于 0")
+        with self.db.session() as conn:
+            instrument = conn.execute("SELECT * FROM instruments WHERE code = ?", (code,)).fetchone()
+            instrument = dict(instrument) if instrument else None
+            if not name and instrument is not None:
+                name = instrument["name"]
+            if not name and (instrument is None or action == "trade"):
+                if instrument is None:
+                    raise ServiceError("行情里没有匹配到这只股票")
+            if instrument is None:
+                if action != "trade" or side != "buy":
+                    raise ServiceError("先记一笔买入")
+                cursor = conn.execute(
+                    """
+                    INSERT INTO instruments (code, name, asset_type, industry, theme, high_vol, liquidity_note)
+                    VALUES (?, ?, ?, '', '', ?, '')
+                    """,
+                    (code, name or code, asset, 1 if is_high_vol(asset, False) else 0),
+                )
+                instrument = {"id": cursor.lastrowid, "code": code, "name": name or code}
+            else:
+                conn.execute(
+                    "UPDATE instruments SET name = ?, asset_type = ?, high_vol = ? WHERE id = ?",
+                    (
+                        name or instrument["name"],
+                        asset,
+                        1 if is_high_vol(asset, bool(instrument["high_vol"])) else 0,
+                        instrument["id"],
+                    ),
+                )
+            if action == "type":
+                return {"instrument_id": instrument["id"]}
+            bundle = self._bundle(conn, day)
+            held = [
+                (plan, view)
+                for plan, inst, view in bundle["built"]
+                if inst["id"] == instrument["id"] and view.shares > 0
+            ]
+            plan = held[-1][0] if held else None
+            view = held[-1][1] if held else None
+            if action == "price" and plan is None:
+                raise ServiceError("还没有持仓，不能记现价")
+            if action == "trade" and side == "sell":
+                if view is None or shares > view.shares + Decimal("0.01"):
+                    raise ServiceError("不能卖出超过持仓的数量")
+            if plan is None:
+                account = bundle["account"]
+                amount = money(price * shares)
+                choices = bundle["params"].entry_days()
+                entry_days = choices[0] if choices else 1
+                cursor = conn.execute(
+                    """
+                    INSERT INTO plans (
+                      instrument_id, thesis, catalyst, risks_json, invalidation, horizon,
+                      regime_snapshot, w_approved, w_max, entry_days, reference_price,
+                      liquidity_ok, industry_ok, fundamental_ok, new_fact, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        instrument["id"],
+                        "仓位",
+                        "",
+                        "[]",
+                        "按容受波动和回撤",
+                        "",
+                        account["regime_intent"] or "neutral",
+                        store_decimal(amount),
+                        store_decimal(amount),
+                        entry_days,
+                        store_decimal(price),
+                        1,
+                        1,
+                        1,
+                        "",
+                        now_iso(),
+                    ),
+                )
+                plan = {"id": cursor.lastrowid}
+            shown = name or instrument["name"]
+            if action == "trade":
+                amount = money(price * shares)
+                cash = money(dec(bundle["account"]["cash"]) + (amount if side == "sell" else -amount))
+                cursor = conn.execute(
+                    """
+                    INSERT INTO fills (
+                      plan_id, side, trade_date, session, price, shares, amount, vwap, reason,
+                      slippage, off_rule, off_rule_reason, note, created_at
+                    ) VALUES (?, ?, ?, 'am', ?, ?, ?, NULL, ?, NULL, 0, '', '', ?)
+                    """,
+                    (
+                        plan["id"],
+                        side,
+                        day.isoformat(),
+                        store_decimal(price),
+                        store_decimal(shares),
+                        store_decimal(amount),
+                        "entry" if side == "buy" else "manual",
+                        now_iso(),
+                    ),
+                )
+                conn.execute("UPDATE account SET cash = ? WHERE id = 1", (store_decimal(cash),))
+                verb = "买入" if side == "buy" else "卖出"
+                self._log(conn, actor, "记入", code, shown, f"{verb} {shares} 股 @ {price}", cursor.lastrowid, subject=f"{verb}单只股票")
+            conn.execute(
+                """
+                INSERT INTO marks (plan_id, trade_date, price, source, kind, note, created_at)
+                VALUES (?, ?, ?, ?, 'close', '', ?)
+                """,
+                (plan["id"], day.isoformat(), store_decimal(price), "记账", now_iso()),
+            )
+            return {"plan_id": plan["id"], "instrument_id": instrument["id"]}
+
+    def update_fill(self, fill_id: int, data: dict, actor: tuple[str, str] = ("", "")) -> dict:
+        day = parse_day(data.get("trade_date"))
+        require_trading_day(day)
+        side = data.get("side")
+        if side not in ("buy", "sell"):
+            raise ServiceError("方向只能是买入或卖出")
+        price = dec(data.get("price"))
+        shares = dec(data.get("shares"))
+        if price <= 0 or shares <= 0:
+            raise ServiceError("价格和数量必须大于 0")
+        amount = money(price * shares)
+        with self.db.session() as conn:
+            row, instrument, fills = self._fill_context(conn, fill_id)
+            proposed = []
+            for item in fills:
+                if item["id"] == fill_id:
+                    item = {**item, "side": side, "shares": shares}
+                proposed.append(item)
+            if held_shares(proposed) < -Decimal("0.01"):
+                raise ServiceError("修改后卖出会超过持仓")
+            self._cash_effect(conn, row["side"], dec(row["amount"]), reverse=True)
+            self._cash_effect(conn, side, amount)
+            conn.execute(
+                """
+                UPDATE fills
+                SET side = ?, trade_date = ?, price = ?, shares = ?, amount = ?, reason = ?
+                WHERE id = ?
+                """,
+                (
+                    side,
+                    day.isoformat(),
+                    store_decimal(price),
+                    store_decimal(shares),
+                    store_decimal(amount),
+                    "entry" if side == "buy" else "manual",
+                    fill_id,
+                ),
+            )
+            before = "买入" if row["side"] == "buy" else "卖出"
+            after = "买入" if side == "buy" else "卖出"
+            self._log(
+                conn, actor, "修改", instrument["code"], instrument["name"],
+                f"{before} {row['shares']} 股 @ {row['price']} 改为 {after} {shares} 股 @ {price}",
+                fill_id,
+                subject="修改单只股票",
+            )
+        return {"ok": True}
+
+    def withdraw_fill(self, fill_id: int, actor: tuple[str, str] = ("", "")) -> dict:
+        with self.db.session() as conn:
+            row, instrument, fills = self._fill_context(conn, fill_id)
+            remaining = [item for item in fills if item["id"] != fill_id]
+            if held_shares(remaining) < -Decimal("0.01"):
+                raise ServiceError("撤回后卖出会超过持仓")
+            self._cash_effect(conn, row["side"], dec(row["amount"]), reverse=True)
+            conn.execute("DELETE FROM fills WHERE id = ?", (fill_id,))
+            verb = "买入" if row["side"] == "buy" else "卖出"
+            self._log(
+                conn, actor, "撤回", instrument["code"], instrument["name"],
+                f"撤回{verb} {row['shares']} 股 @ {row['price']}",
+                None,
+                subject=f"{verb}单只股票",
+            )
+        return {"ok": True}
+
+    def list_activity(self) -> list[dict]:
+        with self.db.session() as conn:
+            rows = conn.execute(
+                "SELECT * FROM activity WHERE action != ? ORDER BY id DESC LIMIT 300",
+                ("更新现价",),
+            )
+            return [_public_activity(row) for row in rows]
+
+    def capital_view(self) -> dict:
+        with self.db.session() as conn:
+            return self._capital_public(conn)
+
+    def record_capital(self, data: dict, actor: tuple[str, str] = ("", "")) -> dict:
+        kind, contributor, occurred_at, amount, note = self._capital_fields(data)
+        with self.db.session() as conn:
+            self._move_cash(conn, amount if kind == "in" else -amount)
+            conn.execute(
+                """
+                INSERT INTO capital_flows (kind, contributor, occurred_at, amount, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (kind, contributor, occurred_at, store_decimal(amount), note, now_iso()),
+            )
+            label = CAPITAL_KINDS[kind]
+            self._log(
+                conn, actor, "记入", "", contributor,
+                f"{label} {amount}，{occurred_at[:16].replace('T', ' ')}",
+                subject=label,
+            )
+            return self._capital_public(conn)
+
+    def update_capital(self, flow_id: int, data: dict, actor: tuple[str, str] = ("", "")) -> dict:
+        kind, contributor, occurred_at, amount, note = self._capital_fields(data)
+        with self.db.session() as conn:
+            row = self._capital_row(conn, flow_id)
+            old_delta = dec(row["amount"]) if row["kind"] == "in" else -dec(row["amount"])
+            new_delta = amount if kind == "in" else -amount
+            self._move_cash(conn, new_delta - old_delta)
+            conn.execute(
+                """
+                UPDATE capital_flows
+                SET kind = ?, contributor = ?, occurred_at = ?, amount = ?, note = ?
+                WHERE id = ?
+                """,
+                (kind, contributor, occurred_at, store_decimal(amount), note, flow_id),
+            )
+            label = CAPITAL_KINDS[kind]
+            old_label = CAPITAL_KINDS.get(row["kind"], row["kind"])
+            self._log(
+                conn, actor, "修改", "", contributor,
+                f"{old_label} {row['contributor']} {row['amount']} 改为 {label} {contributor} {amount}",
+                subject=label,
+            )
+            return self._capital_public(conn)
+
+    def withdraw_capital(self, flow_id: int, actor: tuple[str, str] = ("", "")) -> dict:
+        with self.db.session() as conn:
+            row = self._capital_row(conn, flow_id)
+            delta = dec(row["amount"]) if row["kind"] == "in" else -dec(row["amount"])
+            self._move_cash(conn, -delta)
+            conn.execute("DELETE FROM capital_flows WHERE id = ?", (flow_id,))
+            label = CAPITAL_KINDS.get(row["kind"], "出资")
+            self._log(
+                conn, actor, "撤回", "", row["contributor"],
+                f"撤回{label} {row['contributor']} {row['amount']}",
+                subject=label,
+            )
+            return self._capital_public(conn)
+
+    def _capital_fields(self, data: dict) -> tuple[str, str, str, Decimal, str]:
+        kind = data.get("kind") or "in"
+        if kind not in CAPITAL_KINDS:
+            raise ServiceError("只能记出资或撤资")
+        contributor = (data.get("contributor") or "").strip()
+        if not contributor or len(contributor) > 32:
+            raise ServiceError("出资人要填写，且不超过 32 个字")
+        occurred_at = parse_moment(data.get("occurred_at"))
+        amount = money(dec(data.get("amount")))
+        if amount <= 0:
+            raise ServiceError("金额要大于 0")
+        note = (data.get("note") or "").strip()
+        if len(note) > 200:
+            raise ServiceError("备注不超过 200 个字")
+        return kind, contributor, occurred_at, amount, note
+
+    def _capital_row(self, conn, flow_id: int) -> dict:
+        row = conn.execute("SELECT * FROM capital_flows WHERE id = ?", (flow_id,)).fetchone()
+        if row is None:
+            raise ServiceError("找不到这笔出资记录")
+        return dict(row)
+
+    def _move_cash(self, conn, delta: Decimal) -> None:
+        account = conn.execute("SELECT cash FROM account WHERE id = 1").fetchone()
+        cash = money(dec(account["cash"]) + delta)
+        if cash < -Decimal("0.01"):
+            raise ServiceError("这样改完现金会变成负数")
+        conn.execute("UPDATE account SET cash = ? WHERE id = 1", (store_decimal(cash),))
+
+    def _capital_public(self, conn) -> dict:
+        flows = [dict(row) for row in conn.execute("SELECT * FROM capital_flows ORDER BY occurred_at DESC, id DESC")]
+        contributed = Decimal("0")
+        withdrawn = Decimal("0")
+        people: dict[str, dict] = {}
+        public = []
+        for row in flows:
+            amount = dec(row["amount"])
+            bucket = people.setdefault(row["contributor"], {
+                "name": row["contributor"],
+                "contributed": Decimal("0"),
+                "withdrawn": Decimal("0"),
+                "last_at": row["occurred_at"],
+            })
+            if row["occurred_at"] > bucket["last_at"]:
+                bucket["last_at"] = row["occurred_at"]
+            if row["kind"] == "in":
+                contributed += amount
+                bucket["contributed"] += amount
+            else:
+                withdrawn += amount
+                bucket["withdrawn"] += amount
+            public.append({
+                "id": row["id"],
+                "kind": row["kind"],
+                "kind_label": CAPITAL_KINDS.get(row["kind"], row["kind"]),
+                "contributor": row["contributor"],
+                "occurred_at": row["occurred_at"],
+                "amount": num(amount, "0.01"),
+                "note": row["note"],
+            })
+        cash = dec(conn.execute("SELECT cash FROM account WHERE id = 1").fetchone()["cash"])
+        trade = Decimal("0")
+        for row in conn.execute("SELECT side, amount FROM fills"):
+            amount = dec(row["amount"])
+            trade += amount if row["side"] == "sell" else -amount
+        trade = money(trade)
+        net = money(contributed - withdrawn)
+        opening = money(cash - net - trade)
+        contributors = [
+            {
+                "name": item["name"],
+                "contributed": num(money(item["contributed"]), "0.01"),
+                "withdrawn": num(money(item["withdrawn"]), "0.01"),
+                "net": num(money(item["contributed"] - item["withdrawn"]), "0.01"),
+                "last_at": item["last_at"],
+            }
+            for item in people.values()
+        ]
+        contributors.sort(key=lambda item: (-Decimal(str(item["net"])), item["name"]))
+        return {
+            "cash": num(cash, "0.01"),
+            "contributed": num(money(contributed), "0.01"),
+            "withdrawn": num(money(withdrawn), "0.01"),
+            "net": num(net, "0.01"),
+            "trade_cash": num(trade, "0.01"),
+            "opening": num(opening, "0.01"),
+            "contributors": contributors,
+            "flows": public,
+        }
+
+    def _fill_context(self, conn, fill_id: int) -> tuple[dict, dict, list[dict]]:
+        row = conn.execute("SELECT * FROM fills WHERE id = ?", (fill_id,)).fetchone()
+        if row is None:
+            raise ServiceError("找不到这笔成交")
+        row = dict(row)
+        instrument = conn.execute(
+            """
+            SELECT instruments.* FROM plans
+            JOIN instruments ON instruments.id = plans.instrument_id
+            WHERE plans.id = ?
+            """,
+            (row["plan_id"],),
+        ).fetchone()
+        if instrument is None:
+            raise ServiceError("找不到这笔成交")
+        fills = [
+            dict(item)
+            for item in conn.execute("SELECT * FROM fills WHERE plan_id = ? ORDER BY trade_date, id", (row["plan_id"],))
+        ]
+        return row, dict(instrument), fills
+
+    def _cash_effect(self, conn, side: str, amount: Decimal, reverse: bool = False) -> None:
+        account = conn.execute("SELECT cash FROM account WHERE id = 1").fetchone()
+        cash = dec(account["cash"])
+        delta = amount if side == "sell" else -amount
+        if reverse:
+            delta = -delta
+        conn.execute("UPDATE account SET cash = ? WHERE id = 1", (store_decimal(money(cash + delta)),))
+
+    def _log(
+        self, conn, actor: tuple[str, str], action: str, code: str, name: str, summary: str,
+        fill_id: int | None = None, subject: str = "",
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO activity (at, actor_id, actor_name, action, subject, code, name, summary, fill_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (now_iso(), actor[0] or "", actor[1] or "用户", action, subject, code, name, summary, fill_id),
+        )
 
     def add_mark(self, plan_id: int, data: dict) -> dict:
         day = parse_day(data.get("trade_date"))

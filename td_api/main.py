@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from td_api.auth import AuthError, AuthStore
 from td_api.books import Books
-from td_api.service import Service, ServiceError, parse_day
+from td_api.service import Service, ServiceError, parse_day, position_code
 from td_core.quotes import QuoteError, build_router
 
 DIST = Path(__file__).resolve().parents[1] / "web" / "dist"
@@ -30,6 +30,7 @@ class AccountIn(BaseModel):
     assumption_failed: bool = False
     risk_budget_pct: float = 0.015
     as_of: str | None = None
+    owner_id: str = ""
 
 
 class InstrumentIn(BaseModel):
@@ -131,6 +132,27 @@ class AuthIn(BaseModel):
     password: str
 
 
+class PositionIn(BaseModel):
+    code: str
+    name: str = ""
+    asset_type: str
+    action: str = "trade"
+    side: str = "buy"
+    trade_date: str = ""
+    price: float | None = None
+    shares: float | None = None
+    source: str = ""
+    owner_id: str = ""
+
+
+class FillEdit(BaseModel):
+    side: str
+    trade_date: str
+    price: float
+    shares: float
+    owner_id: str = ""
+
+
 class WatchIn(BaseModel):
     code: str
     name: str = ""
@@ -140,6 +162,53 @@ class WatchIn(BaseModel):
 class QuotesIn(BaseModel):
     source: str = ""
     codes: list[str] = Field(default_factory=list)
+
+
+class CapitalIn(BaseModel):
+    contributor: str
+    occurred_at: str
+    kind: str = "in"
+    amount: float
+    note: str = ""
+    owner_id: str = ""
+
+
+def open_book(request: Request, owner_id: str = ""):
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    user = request.app.state.auth.user_for_token(token)
+    if user is None:
+        raise AuthError("请先登录")
+    owner = owner_id or user.id
+    if owner != user.id and not user.admin:
+        raise AuthError("只能操作自己的记录", 403)
+    return user, request.app.state.books.service_for(owner)
+
+
+def bind_symbol(request: Request, code: str, submitted: str, source: str) -> tuple[str, str]:
+    raw = position_code(code)
+    if not raw.isdigit():
+        name = submitted.strip()
+        if not name:
+            raise ServiceError("行情里没有匹配到这只股票")
+        return raw, name
+    live = ""
+    if source:
+        try:
+            live = request.app.state.quotes.quote(raw, source).name or ""
+        except QuoteError:
+            live = ""
+    cache_key = f"td:symbol:{raw}"
+    redis = request.app.state.auth.redis
+    if live:
+        redis.set(cache_key, live)
+        return raw, live
+    cached = redis.get(cache_key) or ""
+    if cached:
+        return raw, cached
+    if submitted.strip() and not source:
+        return raw, submitted.strip()
+    return raw, ""
 
 
 def create_app() -> FastAPI:
@@ -191,12 +260,12 @@ def create_app() -> FastAPI:
     @app.post("/api/auth/register")
     def register(request: Request, body: AuthIn):
         user, token = request.app.state.auth.register(body.username, body.password)
-        return {"token": token, "user": {"id": user.id, "username": user.username}}
+        return {"token": token, "user": {"id": user.id, "username": user.username, "admin": user.admin}}
 
     @app.post("/api/auth/login")
     def login(request: Request, body: AuthIn):
         user, token = request.app.state.auth.login(body.username, body.password)
-        return {"token": token, "user": {"id": user.id, "username": user.username}}
+        return {"token": token, "user": {"id": user.id, "username": user.username, "admin": user.admin}}
 
     @app.post("/api/auth/logout")
     def logout(request: Request):
@@ -207,7 +276,14 @@ def create_app() -> FastAPI:
     @app.get("/api/auth/me")
     def me(request: Request):
         user = current_user(request)
-        return {"id": user.id, "username": user.username}
+        return {"id": user.id, "username": user.username, "admin": user.admin}
+
+    @app.get("/api/users")
+    def users(request: Request):
+        user = current_user(request)
+        if not user.admin:
+            raise AuthError("只有管理员可以查看所有人", 403)
+        return [{"id": item.id, "username": item.username, "admin": item.admin} for item in request.app.state.auth.list_users()]
 
     @app.get("/api/quote-sources")
     def quote_sources(request: Request):
@@ -274,12 +350,41 @@ def create_app() -> FastAPI:
         return svc(request).activate_rule_version(version_id)
 
     @app.get("/api/snapshot")
-    def snapshot(request: Request, as_of: str | None = None):
-        return svc(request).snapshot(parse_day(as_of) if as_of else None)
+    def snapshot(request: Request, as_of: str | None = None, user_id: str = ""):
+        user = current_user(request)
+        owner = user_id or user.id
+        if owner != user.id and not user.admin:
+            raise AuthError("只能查看自己的账本", 403)
+        return request.app.state.books.service_for(owner).snapshot(parse_day(as_of) if as_of else None)
+
+    @app.get("/api/symbols/{code}")
+    def symbol(request: Request, code: str, source: str = ""):
+        current_user(request)
+        raw, name = bind_symbol(request, code, "", source)
+        return {"code": raw, "name": name}
+
+    @app.get("/api/activity")
+    def activity(request: Request):
+        user = current_user(request)
+        if user.admin:
+            rows = []
+            for person in request.app.state.auth.list_users():
+                for item in request.app.state.books.service_for(person.id).list_activity():
+                    item["owner_id"] = person.id
+                    item["owner_name"] = person.username
+                    rows.append(item)
+            rows.sort(key=lambda item: item["at"], reverse=True)
+            return {"admin": True, "items": rows[:400]}
+        items = request.app.state.books.service_for(user.id).list_activity()
+        for item in items:
+            item["owner_id"] = user.id
+            item["owner_name"] = user.username
+        return {"admin": False, "items": items}
 
     @app.put("/api/account")
     def update_account(request: Request, body: AccountIn):
-        return svc(request).update_account(body.model_dump())
+        user, book = open_book(request, body.owner_id)
+        return book.update_account(body.model_dump(), actor=(user.id, user.username))
 
     @app.post("/api/instruments")
     def create_instrument(request: Request, body: InstrumentIn):
@@ -288,6 +393,43 @@ def create_app() -> FastAPI:
     @app.post("/api/plans/preview")
     def preview_plan(request: Request, body: PlanIn):
         return svc(request).preview_plan(body.model_dump())
+
+    @app.post("/api/positions")
+    def record_position(request: Request, body: PositionIn):
+        user, service = open_book(request, body.owner_id)
+        data = body.model_dump()
+        data["code"], data["name"] = bind_symbol(request, body.code, body.name, body.source)
+        return service.record_position(data, actor=(user.id, user.username))
+
+    @app.patch("/api/positions/fills/{fill_id}")
+    def edit_fill(request: Request, fill_id: int, body: FillEdit):
+        user, service = open_book(request, body.owner_id)
+        return service.update_fill(fill_id, body.model_dump(), actor=(user.id, user.username))
+
+    @app.post("/api/positions/fills/{fill_id}/withdraw")
+    def withdraw_fill(request: Request, fill_id: int, owner_id: str = ""):
+        user, service = open_book(request, owner_id)
+        return service.withdraw_fill(fill_id, actor=(user.id, user.username))
+
+    @app.get("/api/capital")
+    def capital(request: Request, owner_id: str = ""):
+        _user, service = open_book(request, owner_id)
+        return service.capital_view()
+
+    @app.post("/api/capital")
+    def record_capital(request: Request, body: CapitalIn):
+        user, service = open_book(request, body.owner_id)
+        return service.record_capital(body.model_dump(), actor=(user.id, user.username))
+
+    @app.patch("/api/capital/{flow_id}")
+    def edit_capital(request: Request, flow_id: int, body: CapitalIn):
+        user, service = open_book(request, body.owner_id)
+        return service.update_capital(flow_id, body.model_dump(), actor=(user.id, user.username))
+
+    @app.post("/api/capital/{flow_id}/withdraw")
+    def withdraw_capital(request: Request, flow_id: int, owner_id: str = ""):
+        user, service = open_book(request, owner_id)
+        return service.withdraw_capital(flow_id, actor=(user.id, user.username))
 
     @app.post("/api/plans")
     def create_plan(request: Request, body: PlanIn):

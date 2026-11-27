@@ -23,6 +23,7 @@ class AuthError(Exception):
 class User:
     id: str
     username: str
+    admin: bool = False
 
 
 class AuthStore:
@@ -75,6 +76,14 @@ class AuthStore:
             raise AuthError("用户名或密码不正确")
         return self._user(user_id), self._open_session(user_id)
 
+    def list_users(self) -> list[User]:
+        found: list[str] = []
+        for key in self.redis.scan_iter("td:user:*"):
+            rest = key[len("td:user:"):]
+            if rest.isdigit():
+                found.append(rest)
+        return [self._user(user_id) for user_id in sorted(found, key=int)]
+
     def logout(self, token: str) -> None:
         if token:
             self.redis.delete(f"td:session:{token}")
@@ -97,7 +106,15 @@ class AuthStore:
 
     def _user(self, user_id: str) -> User:
         username = self.redis.hget(f"td:user:{user_id}", "username") or user_id
-        return User(id=user_id, username=username)
+        role = self.redis.hget(f"td:user:{user_id}", "role") or ""
+        names = {item.strip().casefold() for item in os.environ.get("TD_ADMINS", "").split(",") if item.strip()}
+        if role == "admin" or username.casefold() in names:
+            admin = True
+        elif role == "user":
+            admin = False
+        else:
+            admin = user_id == "1"
+        return User(id=user_id, username=username, admin=admin)
 
 
 def _username(value: str) -> str:

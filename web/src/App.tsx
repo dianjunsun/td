@@ -1,29 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, api, clearAuth, setAuth, storedUser } from "./api";
+import { ApiError, api, clearAuth, setAuth, storedAdmin, storedUser } from "./api";
 import { localISO } from "./format";
-import { AccountPage } from "./pages/Account";
-import { BookPage } from "./pages/Book";
-import { CoolingPage } from "./pages/Cooling";
-import { Dashboard } from "./pages/Dashboard";
+import { ActivityPage } from "./pages/Activity";
+import { CashPage } from "./pages/Cash";
 import { MarketPage } from "./pages/Market";
-import { PlansPage } from "./pages/Plans";
-import { ReviewPage } from "./pages/Review";
-import { RiskPage } from "./pages/Risk";
+import { PositionsPage } from "./pages/Positions";
 import { RulesPage } from "./pages/Rules";
-import { TradePage } from "./pages/Trade";
-import type { Handbook, QuoteSource, Snapshot } from "./types";
+import type { QuoteSource, Snapshot } from "./types";
 
 const TABS = [
-  ["market", "看盘"],
-  ["dashboard", "今日看板"],
-  ["account", "市场闸门"],
-  ["plans", "交易计划"],
-  ["trade", "建仓与成交"],
-  ["risk", "持仓与风险线"],
-  ["cooling", "冷静期"],
-  ["book", "组合暴露"],
-  ["review", "复盘"],
-  ["rules", "规则参数"],
+  ["market", "行情"],
+  ["positions", "仓位"],
+  ["cash", "现金"],
+  ["rules", "规则"],
+  ["activity", "操作记录"],
 ] as const;
 
 export type Gate = {
@@ -40,15 +30,19 @@ export type Gate = {
   quoteSources: QuoteSource[];
   quoteSource: string;
   setQuoteSource: (id: string) => void;
+  admin: boolean;
 };
 
 export function App() {
   const [user, setUser] = useState(storedUser);
-  const [tab, setTab] = useState(() => location.hash.replace("#", "") || "market");
+  const [admin, setAdmin] = useState(storedAdmin);
+  const [tab, setTab] = useState(() => {
+    const hash = location.hash.replace("#", "");
+    return TABS.some(([id]) => id === hash) ? hash : "market";
+  });
   const [draft, setDraft] = useState<{ code: string; name: string } | null>(null);
   const [asOf, setAsOf] = useState(localISO);
   const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [handbook, setHandbook] = useState<Handbook | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<number | null>(null);
   const [quoteSources, setQuoteSources] = useState<QuoteSource[]>([]);
@@ -62,16 +56,20 @@ export function App() {
   function signOut(message = "") {
     clearAuth();
     setUser("");
+    setAdmin(false);
     setSnap(null);
-    setHandbook(null);
     setError(message);
   }
 
   useEffect(() => {
     if (!user) return;
     let alive = true;
-    api<{ username: string }>("/api/auth/me")
-      .then(() => reload())
+    api<{ username: string; admin?: boolean }>("/api/auth/me")
+      .then((me) => {
+        setAdmin(Boolean(me.admin));
+        localStorage.setItem("td-admin", me.admin ? "1" : "0");
+        return reload();
+      })
       .catch((err) => {
         if (!alive) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -80,9 +78,6 @@ export function App() {
         }
         setError(err instanceof Error ? err.message : "加载失败");
       });
-    api<Handbook>("/api/handbook").then((book) => {
-      if (alive) setHandbook(book);
-    }).catch(() => undefined);
     api<QuoteSource[]>("/api/quote-sources").then((rows) => {
       if (!alive) return;
       setQuoteSources(rows);
@@ -111,12 +106,11 @@ export function App() {
     return <Login onDone={(name) => { setUser(name); setError(""); }} notice={error} />;
   }
 
-  const title = TABS.find(([id]) => id === tab)?.[1] || "今日看板";
-  const danger = snap?.actions.filter((item) => item.level === "danger").length || 0;
+  const title = TABS.find(([id]) => id === tab)?.[1] || "行情";
   const gate: Gate | null = snap
     ? {
         asOf, setAsOf, snap, reload, selected, setSelected, go, draft, setDraft,
-        quoteSources, quoteSource,
+        quoteSources, quoteSource, admin,
         setQuoteSource: (id: string) => {
           localStorage.setItem("td-quote-source", id);
           setQuoteSource(id);
@@ -138,46 +132,45 @@ export function App() {
     <div className="app">
       <aside className="side">
         <div className="brand">
-          <strong>交易纪律台</strong>
-          <span>{snap?.version || "V2.0"} · {snap?.effective_on || "2026-11-19"}</span>
-          <span>{snap?.priority || "账户安全 > 组合风险 > 单笔机会"}</span>
+          <strong>行情与仓位</strong>
+          <span>看价格，记持仓</span>
         </div>
         <nav className="nav">
           {TABS.map(([id, label]) => (
-            <button key={id} className={tab === id ? "active" : ""} onClick={() => go(id)}>
-              {label}
-              {id === "dashboard" && danger > 0 ? <span className="badge">{danger}</span> : null}
-            </button>
+            <button key={id} className={tab === id ? "active" : ""} onClick={() => go(id)}>{label}</button>
           ))}
         </nav>
         <div className="side-foot">
           <div>{user}</div>
           <button className="nav-quiet" onClick={logout}>退出</button>
-          <div>只记录和计算。行情只填写价格，不自动下单。</div>
+          <div>行情只填价格。记下一笔成交之后，才进入仓位。</div>
         </div>
       </aside>
       <main className="main">
         <div className="top">
           <h1>{title}</h1>
-          <label className="asof">
-            核算日
-            <input type="date" value={asOf} onChange={(event) => setAsOf(event.target.value)} />
-          </label>
+          <div className="top-actions">
+            <label className="asof">
+              日期
+              <input type="date" value={asOf} onChange={(event) => setAsOf(event.target.value)} />
+            </label>
+            <button className="btn secondary top-logout" type="button" onClick={logout}>退出</button>
+          </div>
         </div>
         {error ? <div className="banner">{error}</div> : null}
         {!gate ? <p>正在读取账本…</p> : null}
         {gate && tab === "market" ? <MarketPage gate={gate} /> : null}
-        {gate && tab === "dashboard" ? <Dashboard gate={gate} /> : null}
-        {gate && tab === "account" ? <AccountPage gate={gate} /> : null}
-        {gate && tab === "plans" ? <PlansPage gate={gate} /> : null}
-        {gate && tab === "trade" ? <TradePage gate={gate} /> : null}
-        {gate && tab === "risk" ? <RiskPage gate={gate} /> : null}
-        {gate && tab === "cooling" ? <CoolingPage gate={gate} /> : null}
-        {gate && tab === "book" ? <BookPage gate={gate} /> : null}
-        {gate && tab === "review" ? <ReviewPage gate={gate} /> : null}
-        {gate && tab === "rules" ? <RulesPage gate={gate} handbook={handbook} /> : null}
+        {gate && tab === "positions" ? <PositionsPage gate={gate} /> : null}
+        {gate && tab === "cash" ? <CashPage gate={gate} /> : null}
+        {gate && tab === "rules" ? <RulesPage gate={gate} /> : null}
+        {gate && tab === "activity" ? <ActivityPage gate={gate} /> : null}
         {snap ? <p className="foot">{snap.disclaimer}</p> : null}
       </main>
+      <nav className="tabbar" aria-label="页面">
+        {TABS.map(([id, label]) => (
+          <button key={id} className={tab === id ? "active" : ""} type="button" onClick={() => go(id)}>{label}</button>
+        ))}
+      </nav>
     </div>
   );
 }
@@ -194,11 +187,11 @@ function Login({ onDone, notice }: { onDone: (username: string) => void; notice:
     setError("");
     try {
       const path = mode === "register" ? "/api/auth/register" : "/api/auth/login";
-      const result = await api<{ token: string; user: { username: string } }>(path, {
+      const result = await api<{ token: string; user: { username: string; admin?: boolean } }>(path, {
         method: "POST",
         body: JSON.stringify({ username, password }),
       });
-      setAuth(result.token, result.user.username);
+      setAuth(result.token, result.user.username, Boolean(result.user.admin));
       onDone(result.user.username);
     } catch (err) {
       setError(err instanceof Error ? err.message : "登录失败");
@@ -210,8 +203,8 @@ function Login({ onDone, notice }: { onDone: (username: string) => void; notice:
   return (
     <div className="login-wrap">
       <section className="card stack login">
-        <h1>交易纪律台</h1>
-        <p className="hint">每个人一份账本。行情用来填写价格，不会自动下单。</p>
+        <h1>行情与仓位</h1>
+        <p className="hint">每个人一份账本。行情用来填价格，记账不会自动下单。</p>
         {error ? <div className="banner">{error}</div> : null}
         <label>用户名<input value={username} onChange={(event) => setUsername(event.target.value)} /></label>
         <label>密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>

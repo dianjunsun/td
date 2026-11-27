@@ -164,6 +164,195 @@ def test_defensive_neutral_and_correlation(client):
     assert "交易日" in weekend.json()["detail"]
 
 
+def test_position_book_keeps_cost_price_and_size(client):
+    opened = client.post("/api/positions", json={
+        "code": "600519",
+        "name": "贵州茅台",
+        "asset_type": "large_cap",
+        "action": "trade",
+        "side": "buy",
+        "trade_date": "2026-11-24",
+        "price": 100,
+        "shares": 200,
+    })
+    assert opened.status_code == 200, opened.text
+    added = client.post("/api/positions", json={
+        "code": "600519",
+        "name": "贵州茅台",
+        "asset_type": "growth",
+        "action": "trade",
+        "side": "buy",
+        "trade_date": "2026-11-25",
+        "price": 110,
+        "shares": 100,
+    })
+    assert added.status_code == 200, added.text
+    marked = client.post("/api/positions", json={
+        "code": "600519",
+        "name": "贵州茅台",
+        "asset_type": "growth",
+        "action": "price",
+        "trade_date": "2026-11-26",
+        "price": 90,
+    })
+    assert marked.status_code == 200, marked.text
+    snapshot = client.get("/api/snapshot", params={"as_of": "2026-11-26"}).json()
+    plan = snapshot["plans"][0]
+    assert plan["code"] == "600519"
+    assert plan["asset_type"] == "growth"
+    assert plan["view"]["shares"] == 300
+    assert plan["view"]["c"] == pytest.approx(103.3333, abs=0.0001)
+    assert plan["view"]["last_price"] == 90
+    logged = client.get("/api/activity").json()
+    assert [(item["action"], item["subject"]) for item in logged["items"]] == [
+        ("记入", "买入单只股票"),
+        ("记入", "买入单只股票"),
+    ]
+    assert [(row["side"], row["price"], row["shares"]) for row in plan["fills"]] == [
+        ("buy", 100, 200),
+        ("buy", 110, 100),
+    ]
+    too_many = client.post("/api/positions", json={
+        "code": "600519",
+        "asset_type": "growth",
+        "action": "trade",
+        "side": "sell",
+        "trade_date": "2026-11-26",
+        "price": 90,
+        "shares": 301,
+    })
+    assert too_many.status_code == 400
+    assert "超过持仓" in too_many.json()["detail"]
+
+
+def test_fill_edits_stay_with_the_owner_unless_admin(client):
+    opened = client.post("/api/positions", json={
+        "code": "600519",
+        "name": "贵州茅台",
+        "asset_type": "large_cap",
+        "action": "trade",
+        "side": "buy",
+        "trade_date": "2026-11-24",
+        "price": 100,
+        "shares": 10,
+    })
+    assert opened.status_code == 200, opened.text
+    snap = client.get("/api/snapshot", params={"as_of": "2026-11-24"}).json()
+    fill_id = snap["plans"][0]["fills"][0]["id"]
+    edited = client.patch(f"/api/positions/fills/{fill_id}", json={
+        "side": "buy",
+        "trade_date": "2026-11-24",
+        "price": 120,
+        "shares": 10,
+    })
+    assert edited.status_code == 200, edited.text
+    again = client.get("/api/snapshot", params={"as_of": "2026-11-24"}).json()
+    assert again["plans"][0]["view"]["c"] == 120
+    log = client.get("/api/activity").json()
+    assert log["admin"] is True
+    assert any(item["action"] == "修改" and item["subject"] == "修改单只股票" and item["code"] == "600519" for item in log["items"])
+
+    other = client.raw.post("/api/auth/register", json={"username": "other2", "password": "secret2"})
+    assert other.status_code == 200, other.text
+    token = other.json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    denied = client.raw.post(
+        f"/api/positions/fills/{fill_id}/withdraw",
+        params={"owner_id": "1"},
+        headers=headers,
+    )
+    assert denied.status_code == 403
+    created = client.raw.post("/api/positions", headers=headers, json={
+        "code": "000001",
+        "name": "平安银行",
+        "asset_type": "large_cap",
+        "action": "trade",
+        "side": "buy",
+        "trade_date": "2026-11-24",
+        "price": 10,
+        "shares": 100,
+    })
+    assert created.status_code == 200, created.text
+    foreign = client.raw.get("/api/snapshot", params={"as_of": "2026-11-24"}, headers=headers).json()
+    foreign_id = foreign["plans"][0]["fills"][0]["id"]
+    withdrawn = client.post(f"/api/positions/fills/{foreign_id}/withdraw", params={"owner_id": other.json()["user"]["id"]})
+    assert withdrawn.status_code == 200, withdrawn.text
+    combined = client.get("/api/activity").json()
+    assert any(item["owner_name"] == "other2" and item["action"] == "撤回" and item["subject"] == "买入单只股票" for item in combined["items"])
+    hidden = client.raw.get("/api/activity", headers=headers).json()
+    assert hidden["admin"] is False
+    assert all(item["owner_name"] == "other2" for item in hidden["items"])
+
+
+def test_capital_flows_move_cash_without_typing_assets(client):
+    put_account(client, cash=1_000_000, nav=1_000_000)
+    opened = client.post("/api/capital", json={
+        "contributor": "张三",
+        "occurred_at": "2026-11-27T09:30",
+        "kind": "in",
+        "amount": 200000,
+        "note": "首笔",
+    })
+    assert opened.status_code == 200, opened.text
+    book = opened.json()
+    assert book["cash"] == 1_200_000
+    assert book["contributed"] == 200000
+    assert book["opening"] == 1_000_000
+    assert book["contributors"][0]["name"] == "张三"
+    assert book["flows"][0]["kind_label"] == "出资"
+    bought = client.post("/api/positions", json={
+        "code": "600519",
+        "name": "贵州茅台",
+        "asset_type": "large_cap",
+        "action": "trade",
+        "side": "buy",
+        "trade_date": "2026-11-24",
+        "price": 100,
+        "shares": 100,
+    })
+    assert bought.status_code == 200, bought.text
+    after_trade = client.get("/api/capital").json()
+    assert after_trade["cash"] == 1_190_000
+    assert after_trade["trade_cash"] == -10000
+    assert after_trade["opening"] == 1_000_000
+    flow_id = book["flows"][0]["id"]
+    edited = client.patch(f"/api/capital/{flow_id}", json={
+        "contributor": "李四",
+        "occurred_at": "2026-11-27T10:00",
+        "kind": "in",
+        "amount": 150000,
+    })
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["cash"] == 1_140_000
+    assert edited.json()["contributors"][0]["name"] == "李四"
+    too_much = client.post("/api/capital", json={
+        "contributor": "张三",
+        "occurred_at": "2026-11-27T11:00",
+        "kind": "out",
+        "amount": 2_000_000,
+    })
+    assert too_much.status_code == 400
+    assert "负数" in too_much.json()["detail"]
+    withdrawn = client.post(f"/api/capital/{flow_id}/withdraw")
+    assert withdrawn.status_code == 200, withdrawn.text
+    assert withdrawn.json()["cash"] == 990_000
+    assert withdrawn.json()["flows"] == []
+    logged = client.get("/api/activity").json()
+    pairs = [(item["action"], item["subject"]) for item in logged["items"]]
+    assert ("记入", "出资") in pairs
+    assert ("修改", "出资") in pairs
+    assert ("撤回", "出资") in pairs
+    other = client.raw.post("/api/auth/register", json={"username": "cashother", "password": "secret2"})
+    denied = client.raw.post("/api/capital", headers={"Authorization": f"Bearer {other.json()['token']}"}, json={
+        "contributor": "外人",
+        "occurred_at": "2026-11-27T12:00",
+        "kind": "in",
+        "amount": 1,
+        "owner_id": "1",
+    })
+    assert denied.status_code == 403
+
+
 def test_rule_version_changes_sizing_and_can_return_to_v2(client):
     catalog = client.get("/api/rules")
     assert catalog.status_code == 200, catalog.text

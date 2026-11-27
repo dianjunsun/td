@@ -1,5 +1,6 @@
 const TOKEN_KEY = "td-token";
 const USER_KEY = "td-user";
+const ADMIN_KEY = "td-admin";
 
 export class ApiError extends Error {
   status: number;
@@ -18,14 +19,20 @@ export function storedUser() {
   return localStorage.getItem(USER_KEY) || "";
 }
 
-export function setAuth(token: string, username: string) {
+export function storedAdmin() {
+  return localStorage.getItem(ADMIN_KEY) === "1";
+}
+
+export function setAuth(token: string, username: string, admin = false) {
   localStorage.setItem(TOKEN_KEY, token);
   localStorage.setItem(USER_KEY, username);
+  localStorage.setItem(ADMIN_KEY, admin ? "1" : "0");
 }
 
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
+  localStorage.removeItem(ADMIN_KEY);
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

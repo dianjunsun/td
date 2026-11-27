@@ -200,7 +200,10 @@ function timeTicks(bars: Bar[]) {
   if (timed && days.size === 1) {
     return ["09:30", "10:30", "11:30", "14:00", "15:00"].flatMap((mark) => {
       const index = bars.findIndex((bar) => bar.trade_date.slice(11, 16) >= mark);
-      return index < 0 ? [] : [{ index, label: mark }];
+      if (index < 0) return [];
+      const clock = bars[index].trade_date.slice(11, 16);
+      if (clockMinutes(clock) - clockMinutes(mark) > 1) return [];
+      return [{ index, label: mark }];
     }).filter((tick, index, all) => all.findIndex((item) => item.index === tick.index) === index);
   }
   if (timed && days.size <= 8) {
@@ -219,6 +222,11 @@ function timeTicks(bars: Bar[]) {
     const index = Math.round(mark * (bars.length - 1));
     return { index, label: axisLabel(bars[index].trade_date) };
   }).filter((tick, index, all) => all.findIndex((item) => item.index === tick.index) === index);
+}
+
+function clockMinutes(hhmm: string) {
+  const [hour, minute] = hhmm.split(":").map(Number);
+  return hour * 60 + minute;
 }
 
 function axisLabel(stamp: string) {

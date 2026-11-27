@@ -139,6 +139,29 @@ CREATE TABLE IF NOT EXISTS watchlist (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS activity (
+  id INTEGER PRIMARY KEY,
+  at TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_name TEXT NOT NULL,
+  action TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT '',
+  code TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  summary TEXT NOT NULL,
+  fill_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS capital_flows (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  contributor TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  amount TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rule_versions (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -176,6 +199,9 @@ class Database:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.session() as conn:
             conn.executescript(SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(activity)")}
+            if "subject" not in columns:
+                conn.execute("ALTER TABLE activity ADD COLUMN subject TEXT NOT NULL DEFAULT ''")
             if conn.execute("SELECT id FROM account WHERE id = 1").fetchone() is None:
                 conn.execute(
                     "INSERT INTO account (id, risk_budget_pct) VALUES (1, '0.015')"
