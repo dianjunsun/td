@@ -44,6 +44,8 @@ input, select, textarea { width: 100%; min-width: 0; }
 .brand { display: flex; flex-direction: column; gap: 6px; }
 .brand strong { font-family: "Iowan Old Style", "Songti SC", serif; font-size: 22px; font-weight: 600; }
 .brand span, .side-foot { color: var(--side-dim); font-size: 12px; line-height: 1.5; }
+.side-foot { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; }
+.side-session { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; }
 .nav { display: flex; flex-direction: column; gap: 4px; }
 .nav button {
   text-align: left;
@@ -233,7 +235,7 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .login { width: min(420px, 100%); }
 .login .btn { width: 100%; }
 .login h1 { margin: 0; font-family: "Iowan Old Style", "Songti SC", serif; font-size: 28px; }
-.nav-quiet { background: transparent; color: var(--side-dim); border: 0; padding: 0; text-align: left; }
+.nav-quiet { background: transparent; color: var(--side-dim); border: 0; padding: 4px 0; text-align: left; }
 .tabbar { display: none; }
 .board td { min-width: 64px; }
 .board td:first-child { min-width: 88px; }
@@ -249,6 +251,7 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
   .top { align-items: center; margin-bottom: 12px; }
   .top h1 { font-size: 22px; }
   .top-logout, .top-account { display: inline-flex; align-items: center; }
+  .top-logout { margin-left: 10px; }
   .asof { min-width: 0; }
   .asof input { width: 132px; }
   .market-detail { order: -1; }

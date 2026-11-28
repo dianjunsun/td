@@ -229,12 +229,27 @@ def bind_symbol(request: Request, code: str, submitted: str, source: str) -> tup
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        import threading
+
+        from td_api.backup import configured_interval, serve_forever
+
         auth = AuthStore.connect(os.environ.get("TD_REDIS", "redis://127.0.0.1:6379/0"))
         auth.ping()
         app.state.auth = auth
         app.state.books = Books(os.environ.get("TD_DATA_DIR", "data/users"))
         app.state.quotes = build_router()
+        app.state.backup = {"enabled": False, "interval": 0, "last_at": None, "last_key": None, "last_error": None}
+        stop_backup = threading.Event()
+        backup_thread = None
+        if configured_interval() > 0:
+            backup_thread = threading.Thread(
+                target=serve_forever, args=(stop_backup, app.state.backup), name="td-oss-backup", daemon=True,
+            )
+            backup_thread.start()
         yield
+        stop_backup.set()
+        if backup_thread is not None:
+            backup_thread.join(timeout=2)
 
     app = FastAPI(title="个人交易纪律台", version="2.0.0", lifespan=lifespan)
 
@@ -270,6 +285,7 @@ def create_app() -> FastAPI:
             "version": "V2.0",
             "redis": True,
             "quotes": request.app.state.quotes.describe(),
+            "backup": getattr(request.app.state, "backup", None),
         }
 
     @app.post("/api/auth/register")

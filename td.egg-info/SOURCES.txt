@@ -9,6 +9,7 @@ td.egg-info/top_level.txt
 td_api/__init__.py
 td_api/__main__.py
 td_api/auth.py
+td_api/backup.py
 td_api/books.py
 td_api/db.py
 td_api/main.py
@@ -25,5 +26,6 @@ td_core/rules.py
 td_core/stats.py
 tests/test_api.py
 tests/test_auth.py
+tests/test_backup.py
 tests/test_quotes.py
 tests/test_rules.py

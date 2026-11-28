@@ -143,8 +143,10 @@ export function App() {
         </nav>
         <div className="side-foot">
           <div>{user}</div>
-          <button className="nav-quiet" onClick={() => go("account")}>账号</button>
-          <button className="nav-quiet" onClick={logout}>退出</button>
+          <div className="side-session">
+            <button className="nav-quiet" onClick={() => go("account")}>账号</button>
+            <button className="nav-quiet" onClick={logout}>退出</button>
+          </div>
           <div>行情只填价格。记下一笔成交之后，才进入仓位。</div>
         </div>
       </aside>
